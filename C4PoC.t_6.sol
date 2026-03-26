@@ -70,7 +70,9 @@ import {MockWrappedNative} from "test/mocks/MockWrappedNative.sol";
 // ─── External dependencies ───────────────────────────────────────────────────
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {IVerifierProxy} from "@chainlink/contracts/src/v0.8/llo-feeds/v0.5.0/interfaces/IVerifierProxy.sol";
-import {IERC20} from "@openzeppelin/contracts/interfaces/IERC20.sol";
+import {IERC20 as CowIERC20} from "@cowprotocol/interfaces/IERC20.sol";
+import {GPv2Order} from "@cowprotocol/libraries/GPv2Order.sol";
+import {IERC1271} from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import {IERC20Metadata} from "@openzeppelin/contracts/token/ERC20/extensions/IERC20Metadata.sol";
 
 // ─── Forge ───────────────────────────────────────────────────────────────────
@@ -475,38 +477,85 @@ contract C4PoC is Test {
     ///      Run with:
     ///        forge test --match-test testSubmissionValidity -vvv
     ///
-
-
     function testSubmissionValidity() public {
-        // ╔═══════════════════════════════════════════════════════════════════╗
-        // ║   PoC: assetOut Removal Silently Breaks checkUpkeep               ║
-        // ╚═══════════════════════════════════════════════════════════════════╝
-        
-        // 1. Verify initial state: USDC is eligible for auction
-        uint256 usdcAmount = 100_000e6;
-        deal(address(mockUSDC), address(feeAggregator), usdcAmount);
-        
-        (bool upkeepNeededBefore, bytes memory performDataBefore) = auction.checkUpkeep("");
-        assertTrue(upkeepNeededBefore, "Upkeep should be needed initially");
+        uint256 totalSellAmount = 100_000e6;
+        uint256 firstPartialFill = 30_000e6;
+        uint256 remainingSellAmount = totalSellAmount - firstPartialFill;
 
-        // 2. Admin accidentally removes assetOut (LINK) from feeds
-        address[] memory removes = new address[](1);
-        removes[0] = address(mockLINK); // assetOut
-        
-        _changePrank(assetAdmin);
-        auction.applyFeedInfoUpdates(new PriceManager.ApplyFeedInfoUpdateParams[](0), removes);
-        
-        // Verify LINK is removed
-        assertEq(auction.getFeedInfo(address(mockLINK)).dataStreamsFeedDecimals, 0, "LINK feed should be deleted");
-        
-        // 3. Verify checkUpkeep now silently fails (returns false) despite having eligible USDC
-        (bool upkeepNeededAfter, ) = auction.checkUpkeep("");
-        assertFalse(upkeepNeededAfter, "Upkeep should silently fail due to missing assetOut in allowlist");
-        
-        // 4. Verify performUpkeep reverts if manually called with the previously valid payload
-        _changePrank(auctionAdmin);
-        vm.expectRevert(Errors.ZeroFeedData.selector);
-        auction.performUpkeep(performDataBefore); 
+        _startAuction(address(mockUSDC), totalSellAmount);
+        assertEq(auction.getAuctionStart(address(mockUSDC)), block.timestamp, "auction should be live");
+        assertEq(mockUSDC.balanceOf(address(auction)), totalSellAmount, "auction should hold the full order amount");
+        assertEq(
+            mockUSDC.allowance(address(auction), gpV2VaultRelayer),
+            totalSellAmount,
+            "CoW relayer should be approved for the posted auction balance"
+        );
+
+        GPv2Order.Data memory order = GPv2Order.Data({
+            sellToken: CowIERC20(address(mockUSDC)),
+            buyToken: CowIERC20(address(mockLINK)),
+            receiver: address(auction),
+            sellAmount: totalSellAmount,
+            buyAmount: _getAssetOutAmount(address(mockUSDC), totalSellAmount),
+            validTo: uint32(block.timestamp + 1 hours),
+            appData: bytes32(0),
+            feeAmount: 0,
+            kind: GPv2Order.KIND_SELL,
+            partiallyFillable: true,
+            sellTokenBalance: GPv2Order.BALANCE_ERC20,
+            buyTokenBalance: GPv2Order.BALANCE_ERC20
+        });
+        bytes32 orderHash = GPv2Order.hash(order, mockGPV2Settlement.domainSeparator());
+
+        // Sanity check: the freshly posted partially fillable CoW order is valid.
+        bytes4 magicValue = auction.isValidSignature(orderHash, abi.encode(order));
+        assertEq(magicValue, IERC1271.isValidSignature.selector, "fresh CoW order should be valid");
+
+        // Simulate a legitimate first partial fill through the approved CoW vault relayer.
+        _changePrank(gpV2VaultRelayer);
+        mockUSDC.transferFrom(address(auction), address(mockGPV2Settlement), firstPartialFill);
+        assertEq(mockUSDC.balanceOf(address(auction)), remainingSellAmount, "auction should keep only the remainder");
+        assertEq(
+            mockUSDC.balanceOf(address(mockGPV2Settlement)),
+            firstPartialFill,
+            "settlement should receive the legitimate first partial fill"
+        );
+
+        // The same partially fillable order now becomes unusable for the remaining amount because
+        // validation still compares the auction balance against the full original sellAmount.
+        _changePrank(attacker);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                GPV2CompatibleAuction.InsufficientAssetInBalance.selector,
+                address(mockUSDC),
+                totalSellAmount,
+                remainingSellAmount
+            )
+        );
+        auction.isValidSignature(orderHash, abi.encode(order));
+
+        // A replacement order sized to the actual remainder is still valid, which shows the breakage
+        // is specific to reusing the same partially fillable order after the first fill.
+        GPv2Order.Data memory remainderOrder = GPv2Order.Data({
+            sellToken: CowIERC20(address(mockUSDC)),
+            buyToken: CowIERC20(address(mockLINK)),
+            receiver: address(auction),
+            sellAmount: remainingSellAmount,
+            buyAmount: _getAssetOutAmount(address(mockUSDC), remainingSellAmount),
+            validTo: uint32(block.timestamp + 1 hours),
+            appData: bytes32(0),
+            feeAmount: 0,
+            kind: GPv2Order.KIND_SELL,
+            partiallyFillable: true,
+            sellTokenBalance: GPv2Order.BALANCE_ERC20,
+            buyTokenBalance: GPv2Order.BALANCE_ERC20
+        });
+        bytes32 remainderOrderHash = GPv2Order.hash(remainderOrder, mockGPV2Settlement.domainSeparator());
+        assertEq(
+            auction.isValidSignature(remainderOrderHash, abi.encode(remainderOrder)),
+            IERC1271.isValidSignature.selector,
+            "a freshly reposted remainder-sized order is valid"
+        );
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
